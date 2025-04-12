@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+DNS Scanner - Herramienta educativa para detectar servidores DNS expuestos
+Autor: Proyecto educativo de ciberseguridad
+Fecha: 12 de abril de 2025
+"""
+
+import argparse
+import csv
+import dns.resolver
+import dns.query
+import dns.message
+import ipaddress
+import json
+import logging
+import os
+import random
+import requests
+import socket
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("dns_scanner.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("dns_scanner")
+
+class DNSScanner:
+    def __init__(self, api_key=None, output_file="dns_results.csv", max_results=100, threads=10, test_domains=None, blacklist_file=None):
+        self.api_key = api_key
+        self.output_file = output_file
+        self.max_results = max_results
+        self.threads = threads
+        self.dns_servers = []
+        self.results = []
+        
+        # Dominios de prueba predeterminados
+        self.test_domains = test_domains or ["google.com", "microsoft.com", "cloudflare.com", "amazon.com", "facebook.com"]
+        
+        # Carga de blacklist si se proporciona
+        self.blacklist = set()
+        if blacklist_file and os.path.exists(blacklist_file):
+            with open(blacklist_file, 'r') as f:
+                self.blacklist = set(line.strip() for line in f if line.strip())
+            logger.info(f"Cargada blacklist con {len(self.blacklist)} entradas")
+
+    def shodan_search(self):
+        """Busca servidores DNS expuestos utilizando la API de Shodan"""
+        if not self.api_key:
+            logger.error("No se ha proporcionado una API Key de Shodan")
+            return False
+        
+        try:
+            # Query base de Shodan para encontrar servidores DNS expuestos en el puerto 53
+            query = 'port:53 dns'
+            
+            # Estructura de paginación para Shodan
+            page = 1
+            total_results = 0
+            
+            logger.info("Iniciando búsqueda en Shodan para servidores DNS expuestos...")
+            
+            while total_results < self.max_results:
+                try:
+                    # URL para la API de Shodan con paginación
+                    url = f'https://api.shodan.io/shodan/host/search?key={self.api_key}&query={query}&page={page}'
+                    response = requests.get(url)
+                    data = response.json()
+                    
+                    # Verificar si hay resultados en esta página
+                    matches = data.get('matches', [])
+                    if not matches:
+                        logger.info(f"No hay más resultados disponibles después de la página {page}")
+                        break
+                    
+                    # Procesar los resultados
+                    for match in matches:
+                        ip = match.get('ip_str')
+                        
+                        # Verificar si la IP está en la blacklist
+                        if ip in self.blacklist:
+                            logger.debug(f"IP {ip} encontrada en blacklist - omitiendo")
+                            continue
+                        
+                        self.dns_servers.append({
+                            'ip': ip,
+                            'port': match.get('port', 53),
+                            'isp': match.get('isp', 'Desconocido'),
+                            'country': match.get('location', {}).get('country_name', 'Desconocido'),
+                            'city': match.get('location', {}).get('city', 'Desconocido'),
+                            'org': match.get('org', 'Desconocido')
+                        })
+                        
+                        total_results += 1
+                        if total_results >= self.max_results:
+                            break
+                    
+                    # Pasar a la siguiente página
+                    page += 1
+                    
+                    # Pequeña pausa para evitar sobrecargar la API
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    logger.error(f"Error en la página {page} de Shodan: {str(e)}")
+                    break
+            
+            logger.info(f"Búsqueda en Shodan completada: {len(self.dns_servers)} servidores DNS encontrados")
+            return len(self.dns_servers) > 0
+            
+        except Exception as e:
+            logger.error(f"Error en la búsqueda de Shodan: {str(e)}")
+            return False
+
+    def check_dns_resolution(self, dns_server):
+        """Verifica si un servidor DNS puede resolver correctamente dominios"""
+        ip = dns_server['ip']
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = [ip]
+        resolver.timeout = 3
+        resolver.lifetime = 3
+        
+        # Seleccionar un dominio de prueba aleatorio
+        test_domain = random.choice(self.test_domains)
+        
+        try:
+            answers = resolver.resolve(test_domain, 'A')
+            dns_server['resolves'] = True
+            dns_server['test_domain'] = test_domain
+            dns_server['resolution_result'] = ', '.join([str(answer) for answer in answers])
+            logger.debug(f"El servidor {ip} resolvió correctamente {test_domain}")
+            return True
+        except Exception as e:
+            dns_server['resolves'] = False
+            dns_server['test_domain'] = test_domain
+            dns_server['resolution_result'] = f"Error: {str(e)}"
+            logger.debug(f"El servidor {ip} no pudo resolver {test_domain}: {str(e)}")
+            return False
+
+    def check_dns_recursion(self, dns_server):
+        """Verifica si un servidor DNS permite consultas recursivas"""
+        ip = dns_server['ip']
+        
+        try:
+            # Crear una consulta DNS recursiva simulada
+            domain = random.choice(self.test_domains)
+            request = dns.message.make_query(domain, dns.rdatatype.NS, want_dnssec=True)
+            request.flags |= dns.flags.RD  # Configurar el bit de recursión deseada
+            
+            # Enviar la consulta
+            response = dns.query.udp(request, ip, timeout=3)
+            
+            # Verificar si la respuesta tiene el bit de recursión disponible
+            recursion_available = (response.flags & dns.flags.RA) != 0
+            dns_server['recursion'] = recursion_available
+            
+            logger.debug(f"Servidor {ip}: recursión {'disponible' if recursion_available else 'no disponible'}")
+            return recursion_available
+        except Exception as e:
+            dns_server['recursion'] = "Error al verificar"
+            dns_server['recursion_error'] = str(e)
+            logger.debug(f"Error al verificar recursión en {ip}: {str(e)}")
+            return False
+
+    def test_dns_amplification(self, dns_server):
+        """Verifica si un servidor DNS es vulnerable a ataques de amplificación DNS"""
+        ip = dns_server['ip']
+        
+        try:
+            # Crear consulta tipo ANY para un dominio que potencialmente tenga respuestas grandes
+            domain = random.choice(['google.com', 'amazon.com', 'microsoft.com'])
+            
+            # Tamaño de la consulta inicial
+            request = dns.message.make_query(domain, dns.rdatatype.ANY)
+            request_size = len(request.to_wire())
+            
+            # Enviar la consulta y medir el tamaño de la respuesta
+            response = dns.query.udp(request, ip, timeout=3)
+            response_size = len(response.to_wire())
+            
+            # Calcular el factor de amplificación
+            amplification_factor = response_size / request_size if request_size > 0 else 0
+            
+            dns_server['amplification_factor'] = amplification_factor
+            dns_server['request_size'] = request_size
+            dns_server['response_size'] = response_size
+            
+            # Un factor de amplificación mayor a 4 puede considerarse potencialmente problemático
+            is_vulnerable = amplification_factor > 4
+            dns_server['amplification_vulnerable'] = is_vulnerable
+            
+            logger.debug(f"Servidor {ip}: factor de amplificación {amplification_factor:.2f} - {'Vulnerable' if is_vulnerable else 'No vulnerable'}")
+            return is_vulnerable
+        except Exception as e:
+            dns_server['amplification_factor'] = "Error"
+            dns_server['amplification_error'] = str(e)
+            logger.debug(f"Error al verificar amplificación DNS en {ip}: {str(e)}")
+            return False
+
+    def process_dns_server(self, dns_server):
+        """Procesa un servidor DNS ejecutando todas las verificaciones configuradas"""
+        ip = dns_server['ip']
+        logger.info(f"Analizando servidor DNS: {ip}")
+        
+        # Verificar resolución DNS básica
+        resolution_result = self.check_dns_resolution(dns_server)
+        
+        # Si la resolución básica funciona, realizar verificaciones avanzadas
+        if resolution_result:
+            # Verificar si permite consultas recursivas
+            self.check_dns_recursion(dns_server)
+            
+            # Probar vulnerabilidad a amplificación DNS
+            self.test_dns_amplification(dns_server)
+        
+        self.results.append(dns_server)
+        return dns_server
+
+    def scan(self):
+        """Ejecuta el escaneo completo de servidores DNS"""
+        start_time = datetime.now()
+        logger.info(f"Iniciando escaneo DNS el {start_time}")
+        
+        # Buscar servidores DNS expuestos en Shodan
+        if not self.shodan_search():
+            logger.error("No se encontraron servidores DNS o hubo un error en la búsqueda")
+            return False
+        
+        # Procesar cada servidor DNS usando hilos para mayor eficiencia
+        logger.info(f"Analizando {len(self.dns_servers)} servidores DNS con {self.threads} hilos")
+        with ThreadPoolExecutor(max_workers=self.threads) as executor:
+            executor.map(self.process_dns_server, self.dns_servers)
+        
+        # Guardar resultados
+        self.save_results()
+        
+        end_time = datetime.now()
+        duration = end_time - start_time
+        logger.info(f"Escaneo completado en {duration}. Resultados guardados en {self.output_file}")
+        return True
+
+    def save_results(self):
+        """Guarda los resultados en un archivo CSV"""
+        try:
+            with open(self.output_file, 'w', newline='', encoding='utf-8') as csvfile:
+                # Determinar los campos disponibles en los resultados
+                fieldnames = set()
+                for result in self.results:
+                    fieldnames.update(result.keys())
+                
+                fieldnames = sorted(list(fieldnames))
+                
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                writer.writeheader()
+                for result in self.results:
+                    writer.writerow(result)
+            
+            logger.info(f"Resultados guardados exitosamente en {self.output_file}")
+            
+            # También guardamos un resumen en formato JSON para fácil procesamiento
+            with open(self.output_file.replace('.csv', '.json'), 'w', encoding='utf-8') as jsonfile:
+                json.dump(self.results, jsonfile, indent=4)
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error al guardar los resultados: {str(e)}")
+            return False
+
+    def print_summary(self):
+        """Imprime un resumen de los resultados del escaneo"""
+        if not self.results:
+            print("No hay resultados para mostrar.")
+            return
+        
+        total = len(self.results)
+        resolvable = sum(1 for r in self.results if r.get('resolves', False) is True)
+        recursive = sum(1 for r in self.results if r.get('recursion', False) is True)
+        vulnerable = sum(1 for r in self.results if r.get('amplification_vulnerable', False) is True)
+        
+        print("\n" + "="*80)
+        print(f"RESUMEN DEL ESCANEO DNS")
+        print("="*80)
+        print(f"Total de servidores DNS analizados: {total}")
+        print(f"Servidores DNS que resuelven consultas: {resolvable} ({resolvable/total*100:.1f}%)")
+        print(f"Servidores DNS que permiten consultas recursivas: {recursive} ({recursive/total*100:.1f}%)")
+        print(f"Servidores DNS vulnerables a amplificación: {vulnerable} ({vulnerable/total*100:.1f}%)")
+        print("="*80)
+        print(f"Resultados guardados en: {self.output_file}")
+        print(f"Resultados en JSON: {self.output_file.replace('.csv', '.json')}")
+        print("="*80)
+
+def main():
+    parser = argparse.ArgumentParser(description='Scanner de Servidores DNS - Herramienta Educativa')
+    parser.add_argument('-k', '--api-key', help='API Key de Shodan', required=True)
+    parser.add_argument('-o', '--output', default='dns_results.csv', help='Archivo de salida para resultados (CSV)')
+    parser.add_argument('-m', '--max-results', type=int, default=100, help='Número máximo de resultados a procesar')
+    parser.add_argument('-t', '--threads', type=int, default=10, help='Número de hilos para el análisis')
+    parser.add_argument('-d', '--domains', help='Lista de dominios de prueba separados por comas')
+    parser.add_argument('-b', '--blacklist', help='Archivo con IPs en blacklist, una por línea')
+    
+    args = parser.parse_args()
+    
+    # Configurar dominios de prueba si se especifican
+    test_domains = None
+    if args.domains:
+        test_domains = [domain.strip() for domain in args.domains.split(',')]
+    
+    # Inicializar y ejecutar el scanner
+    scanner = DNSScanner(
+        api_key=args.api_key,
+        output_file=args.output,
+        max_results=args.max_results,
+        threads=args.threads,
+        test_domains=test_domains,
+        blacklist_file=args.blacklist
+    )
+    
+    # Ejecutar el escaneo
+    scanner.scan()
+    
+    # Mostrar resumen
+    scanner.print_summary()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nEscaneo interrumpido por el usuario")
+        sys.exit(0)
+    except Exception as e:
+        print(f"Error inesperado: {str(e)}")
+        sys.exit(1)
